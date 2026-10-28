@@ -13,6 +13,7 @@ Run from the project root:
 import argparse
 import fcntl
 import os
+import random
 import sqlite3
 import time
 from datetime import datetime
@@ -93,6 +94,11 @@ def dispatch(db: sqlite3.Connection, producer, limit: int) -> int:
         if row is None:
             break
         transaction_id, payload_json = row
+
+        delay = random.uniform(1.0, 5.0)
+        print(f"WAIT | {delay:.2f}s | transaction_id={transaction_id}",
+              flush=True)
+        time.sleep(delay)
 
         # A crash after this commit but before/after send keeps the event
         # PENDING, so a restart will send the SAME ID again.

@@ -2,14 +2,20 @@
 
 Every committed row is one simulated POS event. Restarting resumes from the
 committed CSV cursor rather than replaying rows as new swipes.
+
+By default, read all remaining CSV rows, one swipe every 3 seconds.
+Use --limit only for a short test; --interval 0 allows an unpaced import.
 """
 
 import argparse
 import csv
+import fcntl
 import hashlib
 import json
+import math
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -85,19 +91,36 @@ def initialize_source(db: sqlite3.Connection) -> None:
                 "Khong tiep tuc voi cursor cu; hay kiem tra nguon du lieu."
             )
         db.commit()
-    except Exception:
+    except BaseException:
         db.rollback()
         raise
 
 
-def simulate_swipes(db: sqlite3.Connection, limit: int) -> int:
-    if limit < 0:
+def simulate_swipes(
+    db: sqlite3.Connection, limit: int | None = None, interval: float = 3.0,
+) -> int:
+    if limit is not None and limit < 0:
         raise ValueError("--limit phai >= 0")
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError("--interval phai la so huu han >= 0")
+    if limit == 0:
+        return 0
+
+    next_line = db.execute(
+        "SELECT next_line FROM simulator_state WHERE source_file = ?",
+        (SOURCE_FILE,),
+    ).fetchone()[0]
     created = 0
     with CSV_FILE.open("r", newline="", encoding="utf-8-sig") as stream:
         for line_number, row in enumerate(csv.DictReader(stream), start=2):
-            if created >= limit:
+            if limit is not None and created >= limit:
                 break
+            if line_number < next_line:
+                continue
+
+            # Sleep outside a SQLite transaction, so dispatcher can send.
+            if created and interval:
+                time.sleep(interval)
 
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -129,12 +152,15 @@ def simulate_swipes(db: sqlite3.Connection, limit: int) -> int:
                     (line_number + 1, SOURCE_FILE),
                 )
                 db.commit()
-            except Exception:
+            except BaseException:
                 db.rollback()
                 raise
 
             created += 1
-            print(f"POS swipe | CSV line {line_number} | ID {tx_id} | PENDING")
+            print(f"POS swipe | CSV line {line_number} | ID {tx_id} | PENDING",
+                  flush=True)
+    if limit is None or created < limit:
+        print("POS: da doc het CSV. Khong tu quay lai dau file.", flush=True)
     return created
 
 
@@ -150,22 +176,43 @@ def print_status(db: sqlite3.Connection) -> None:
     print(f"OUTBOX_DB: {DB_FILE}")
     print(f"PENDING: {counts.get('PENDING', 0)}")
     print(f"SENT: {counts.get('SENT', 0)}")
-    print(f"NEXT_CSV_LINE: {cursor[0] if cursor else 2}")
+    print(f"NEXT_CSV_LINE: {cursor[0] if cursor else 2}", flush=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=3)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Maximum new swipes; default: all remaining rows")
+    parser.add_argument("--interval", type=float, default=3.0,
+                        help="Seconds between swipes (default: 3; 0: no delay)")
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
+    if args.limit is not None and args.limit < 0:
+        parser.error("--limit must be >= 0")
+    if not math.isfinite(args.interval) or args.interval < 0:
+        parser.error("--interval must be finite and >= 0")
     with open_database() as db:
-        initialize_source(db)
         if args.status:
             print_status(db)
             return
-        count = simulate_swipes(db, args.limit)
-        print(f"Da ghi ben vung {count} giao dich gia lap vao SQLite")
-        print_status(db)
+
+        # Only one simulator may consume this outbox's CSV cursor at a time.
+        lock_path = DB_FILE.with_name(DB_FILE.name + ".pos.lock")
+        with lock_path.open("w") as lock_file:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError("Another POS simulator is already running")
+            try:
+                initialize_source(db)
+                count = simulate_swipes(db, args.limit, args.interval)
+                print(f"Da ghi ben vung {count} giao dich gia lap vao SQLite",
+                      flush=True)
+            except KeyboardInterrupt:
+                print("\nPOS stopped. Restart resumes from NEXT_CSV_LINE.",
+                      flush=True)
+            finally:
+                print_status(db)
 
 
 if __name__ == "__main__":
