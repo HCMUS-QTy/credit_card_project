@@ -13,6 +13,7 @@ Run from the project root:
 import argparse
 import fcntl
 import os
+import random
 import sqlite3
 import time
 from datetime import datetime
@@ -94,8 +95,10 @@ def dispatch(db: sqlite3.Connection, producer, limit: int) -> int:
             break
         transaction_id, payload_json = row
 
-        # A crash after this commit but before/after send keeps the event
-        # PENDING, so a restart will send the SAME ID again.
+        # delay = random.uniform(1.0, 5.0)
+        # time.sleep(delay)
+
+        # Ghi nhận lần thử gửi sau khi đã chờ.
         mark_attempt(db, transaction_id)
         try:
             metadata = producer.send(

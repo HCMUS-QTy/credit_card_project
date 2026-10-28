@@ -3,7 +3,8 @@
 Every committed row is one simulated POS event. Restarting resumes from the
 committed CSV cursor rather than replaying rows as new swipes.
 """
-
+import random
+import time
 import argparse
 import csv
 import hashlib
@@ -90,14 +91,11 @@ def initialize_source(db: sqlite3.Connection) -> None:
         raise
 
 
-def simulate_swipes(db: sqlite3.Connection, limit: int) -> int:
-    if limit < 0:
-        raise ValueError("--limit phai >= 0")
+def simulate_swipes(db: sqlite3.Connection) -> int:
     created = 0
     with CSV_FILE.open("r", newline="", encoding="utf-8-sig") as stream:
         for line_number, row in enumerate(csv.DictReader(stream), start=2):
-            if created >= limit:
-                break
+            
 
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -133,6 +131,8 @@ def simulate_swipes(db: sqlite3.Connection, limit: int) -> int:
                 db.rollback()
                 raise
 
+            delay = random.uniform(1.0, 5.0)
+            time.sleep(delay)
             created += 1
             print(f"POS swipe | CSV line {line_number} | ID {tx_id} | PENDING")
     return created
@@ -155,7 +155,6 @@ def print_status(db: sqlite3.Connection) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
     with open_database() as db:
@@ -163,7 +162,7 @@ def main() -> None:
         if args.status:
             print_status(db)
             return
-        count = simulate_swipes(db, args.limit)
+        count = simulate_swipes(db)
         print(f"Da ghi ben vung {count} giao dich gia lap vao SQLite")
         print_status(db)
 
