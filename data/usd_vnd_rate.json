@@ -1,0 +1,10 @@
+{
+  "base_currency": "USD",
+  "quote_currency": "VND",
+  "rate_type": "transfer_buy",
+  "rate": "25640.00",
+  "bank_published_at": "10/28/2026 11:35:08 AM",
+  "retrieved_at": "2026-10-28T11:45:38+07:00",
+  "source": "Vietcombank XML",
+  "source_url": "https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx"
+}
