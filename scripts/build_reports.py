@@ -81,8 +81,12 @@ def current_snapshot(store, base):
 
 
 def read_transactions(spark, source):
-    raw = (spark.read.option("header", True).option("mode", "FAILFAST")
-           .option("enforceSchema", False).csv(source["transactions_path"]))
+    reader = (spark.read.option("header", True).option("multiLine", True)
+              .option("mode", "FAILFAST").option("enforceSchema", False))
+    raw = reader.csv(source["transactions_path"])
+    if "raw_value" in raw.columns:
+        # New snapshots use standard CSV quote escaping for Power BI compatibility.
+        raw = reader.option("escape", '"').csv(source["transactions_path"])
     missing = REQUIRED_COLUMNS - set(raw.columns)
     if missing:
         raise RuntimeError(f"Curated thieu cot: {sorted(missing)}")
@@ -224,7 +228,7 @@ def build_reports(spark, base, top_n=10):
         for name, table in tables.items():
             table = (table.withColumn("source_snapshot_id", F.lit(source["snapshot_id"]))
                      .select("source_snapshot_id", *table.columns))
-            (table.coalesce(1).write.mode("errorifexists").option("header", True)
+            (table.coalesce(1).write.mode("errorifexists").option("header", True).option("escape", '"')
              .csv(f"{temporary}/{name}"))
         store.write_json(f"{temporary}/summary.json", summary)
         store.write_json(f"{temporary}/manifest.json", manifest)

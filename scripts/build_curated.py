@@ -9,6 +9,7 @@ the main() file lock serializes builders on that host. Each run recomputes a
 complete snapshot, then switches CURRENT.json to that completed snapshot.
 """
 
+import csv
 import fcntl
 import json
 import os
@@ -36,7 +37,8 @@ CORE_COLUMNS = [
 FX_COLUMNS = [
     "fx_rate", "fx_retrieved_at", "fx_bank_published_at", "amount_vnd",
 ]
-ALL_COLUMNS = CORE_COLUMNS + FX_COLUMNS
+AUDIT_COLUMNS = ["topic", "partition", "kafka_timestamp", "raw_value", "validation_errors"]
+ALL_COLUMNS = CORE_COLUMNS + FX_COLUMNS + AUDIT_COLUMNS
 BUSINESS_COLUMNS = [c for c in CORE_COLUMNS if c != "offset"]
 GROUP_STATUSES = {
     "success": ["SUCCESS"],
@@ -80,6 +82,31 @@ class HadoopStore:
         finally:
             stream.close()
 
+    def read_json(self, path):
+        reader = self.jvm.java.io.BufferedReader(
+            self.jvm.java.io.InputStreamReader(self.fs.open(self.Path(path)), "UTF-8"))
+        try:
+            lines = []
+            while True:
+                line = reader.readLine()
+                if line is None:
+                    break
+                lines.append(line)
+            return json.loads("\n".join(lines))
+        finally:
+            reader.close()
+
+    def csv_header(self, path):
+        reader = self.jvm.java.io.BufferedReader(
+            self.jvm.java.io.InputStreamReader(self.fs.open(self.Path(path)), "UTF-8"))
+        try:
+            line = reader.readLine()
+            if line is None:
+                raise RuntimeError(f"CSV rong: {path}")
+            return tuple(next(csv.reader([line])))
+        finally:
+            reader.close()
+
     def rename(self, source, target, overwrite=False):
         Rename = self.jvm.org.apache.hadoop.fs.Options.Rename
         options = self.gateway.new_array(Rename, 1)
@@ -106,6 +133,23 @@ def discover_inputs(store, base, checkpoint):
     if not committed:
         raise RuntimeError("Chua co batch da commit trong checkpoint dang dung.")
     cutoff = max(committed)
+    managed = {}
+    for item in store.children(f"{base}/processed_v2/_batches"):
+        match = re.fullmatch(r"batch_id=(\d+)", item.getPath().getName())
+        if not item.isDirectory() or not match or int(match[1]) > cutoff:
+            continue
+        complete = f"{item.getPath()}/complete.json"
+        if not store.exists(complete):
+            raise RuntimeError(f"Batch da commit nhung thieu complete.json: {item.getPath()}")
+        manifest = store.read_json(complete)
+        if manifest.get("format_version") != 1 or manifest["input"]["batch_id"] != int(match[1]):
+            raise RuntimeError("Manifest batch khong hop le")
+        managed[int(match[1])] = manifest
+        for group, record in manifest["groups"].items():
+            expected = f"{base}/processed_v2/{group}/{item.getPath().getName()}"
+            if (group not in GROUP_STATUSES or record["path"] != store.qualified(expected)
+                    or not store.exists(f"{expected}/_SUCCESS")):
+                raise RuntimeError(f"Batch da commit nhung CSV bi thieu/sai: {expected}")
     sources = {}
     for group in GROUP_STATUSES:
         files = []
@@ -113,6 +157,8 @@ def discover_inputs(store, base, checkpoint):
             match = re.fullmatch(r"batch_id=(\d+)", item.getPath().getName())
             if not item.isDirectory() or not match or int(match[1]) > cutoff:
                 continue
+            if int(match[1]) in managed and group not in managed[int(match[1])]["groups"]:
+                raise RuntimeError("Thu muc CSV khong khop manifest batch")
             directory = item.getPath().toString()
             if not store.exists(f"{directory}/_SUCCESS"):
                 raise RuntimeError(f"Batch da commit nhung CSV chua hoan tat: {directory}")
@@ -136,25 +182,35 @@ def discover_inputs(store, base, checkpoint):
 def read_events(spark, sources):
     parts = []
     for group, paths in sources.items():
-        df = (spark.read.option("header", True)
-              .option("enforceSchema", False).option("mode", "FAILFAST").csv(paths))
-        missing = set(CORE_COLUMNS) - set(df.columns)
-        unexpected = set(df.columns) - set(ALL_COLUMNS)
-        if missing or unexpected:
-            raise RuntimeError(
-                f"Schema {group} khong khop; thieu={sorted(missing)}, "
-                f"cot chua ho tro={sorted(unexpected)}"
+        # Legacy and new batches have different headers. Read each schema
+        # separately; never apply one CSV header to all historical files.
+        store = HadoopStore(spark, paths[0])
+        by_header = {}
+        for path in paths:
+            header = store.csv_header(path)
+            by_header.setdefault(header, []).append(path)
+        for header, matching_paths in by_header.items():
+            missing = set(CORE_COLUMNS) - set(header)
+            unexpected = set(header) - set(ALL_COLUMNS)
+            if missing or unexpected or len(header) != len(set(header)):
+                raise RuntimeError(
+                    f"Schema {group} khong khop; thieu={sorted(missing)}, "
+                    f"cot chua ho tro={sorted(unexpected)}"
+                )
+            df = (spark.read.option("header", True).option("multiLine", True)
+                  .option("enforceSchema", False).option("mode", "FAILFAST")
+                  .option("escape", '"' if "raw_value" in header else "\\")
+                  .csv(matching_paths))
+            for name in FX_COLUMNS + AUDIT_COLUMNS:
+                if name not in df.columns:
+                    df = df.withColumn(name, F.lit(None).cast("string"))
+            parts.append(
+                df.select(*ALL_COLUMNS)
+                .withColumn("_source_group", F.lit(group))
+                .withColumn("_source_file", F.input_file_name())
+                .withColumn("_source_batch_id", F.regexp_extract(
+                    F.col("_source_file"), r"/batch_id=(\d+)/", 1).cast("long"))
             )
-        for name in FX_COLUMNS:
-            if name not in df.columns:
-                df = df.withColumn(name, F.lit(None).cast("string"))
-        parts.append(
-            df.select(*ALL_COLUMNS)
-            .withColumn("_source_group", F.lit(group))
-            .withColumn("_source_file", F.input_file_name())
-            .withColumn("_source_batch_id", F.regexp_extract(
-                F.col("_source_file"), r"/batch_id=(\d+)/", 1).cast("long"))
-        )
     return reduce(lambda a, b: a.unionByName(b), parts)
 
 
@@ -221,6 +277,16 @@ def build_snapshot(spark, base, checkpoint):
     pointer_temporary = None
     try:
         source_rows = raw.count()
+        # Check actual CSV counts against each managed batch, not just _SUCCESS.
+        manifests = {}
+        for row in raw.groupBy("_source_batch_id", "_source_group").count().collect():
+            batch_id = row["_source_batch_id"]
+            path = f"{base}/processed_v2/_batches/batch_id={batch_id:010d}/complete.json"
+            if batch_id not in manifests:
+                manifests[batch_id] = store.read_json(path) if store.exists(path) else None
+            manifest = manifests[batch_id]
+            if manifest and row["count"] != manifest["groups"][row["_source_group"]]["rows"]:
+                raise RuntimeError(f"So dong CSV khong khop manifest batch {batch_id}")
         transactions, excluded = prepare_transactions(raw)
         transactions = transactions.persist(StorageLevel.MEMORY_AND_DISK)
         unique_rows = transactions.count()
@@ -256,10 +322,10 @@ def build_snapshot(spark, base, checkpoint):
         # One CSV part is convenient for this small teaching dataset. All
         # statuses remain available; only SUCCESS contributes to money totals.
         (transactions.coalesce(1).write.mode("errorifexists")
-         .option("header", True).csv(f"{temporary}/transactions"))
+         .option("header", True).option("escape", '"').csv(f"{temporary}/transactions"))
         if excluded_rows:
             (excluded.select(*ALL_COLUMNS).coalesce(1).write.mode("errorifexists")
-             .option("header", True).csv(f"{temporary}/excluded_missing_id"))
+             .option("header", True).option("escape", '"').csv(f"{temporary}/excluded_missing_id"))
         store.write_json(f"{temporary}/manifest.json", manifest)
         store.rename(temporary, final)
         # Never delete CURRENT before replacing it. On HDFS the rename-overwrite
