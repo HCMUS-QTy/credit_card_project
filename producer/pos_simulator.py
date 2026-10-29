@@ -7,11 +7,13 @@ import random
 import time
 import argparse
 import csv
+import fcntl
 import hashlib
 import json
 import os
 import sqlite3
 import uuid
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -30,6 +32,39 @@ def project_path(name: str) -> Path:
 CSV_FILE = project_path("CSV_FILE")
 DB_FILE = project_path("OUTBOX_DB_PATH")
 SOURCE_FILE = str(CSV_FILE.resolve())
+
+EXPECTED_COLUMNS = [
+    "User", "Card", "Year", "Month", "Day", "Time",
+    "Amount", "Use Chip", "Merchant Name", "Merchant City",
+    "Merchant State", "Zip", "MCC", "Errors?", "Is Fraud?",
+]
+
+
+def load_delay_bounds() -> tuple[float, float]:
+    minimum = float(os.getenv("PRODUCER_DELAY_MIN_SECONDS", "1"))
+    maximum = float(os.getenv("PRODUCER_DELAY_MAX_SECONDS", "5"))
+    if not (1 <= minimum <= maximum <= 5):
+        raise ValueError("Khoang cho phai thoa 1 <= MIN <= MAX <= 5")
+    return minimum, maximum
+
+
+@contextmanager
+def simulator_lock():
+    """Serialize POS simulators without blocking the Kafka dispatcher."""
+    database = DB_FILE.resolve()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = database.with_name(database.name + ".pos.lock")
+    with lock_path.open("a") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(
+                f"Mot POS khac dang dung outbox: {database}"
+            ) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def open_database() -> sqlite3.Connection:
@@ -86,19 +121,44 @@ def initialize_source(db: sqlite3.Connection) -> None:
                 "Khong tiep tuc voi cursor cu; hay kiem tra nguon du lieu."
             )
         db.commit()
-    except Exception:
+    except BaseException:
         db.rollback()
         raise
 
 
-def simulate_swipes(db: sqlite3.Connection) -> int:
+def simulate_swipes(db: sqlite3.Connection, limit: int = 0) -> int:
+    if limit < 0:
+        raise ValueError("limit phai >= 0")
+    delay_min, delay_max = load_delay_bounds()
     created = 0
     with CSV_FILE.open("r", newline="", encoding="utf-8-sig") as stream:
-        for line_number, row in enumerate(csv.DictReader(stream), start=2):
-            
+        reader = csv.DictReader(stream, strict=True)
 
-            db.execute("BEGIN IMMEDIATE")
+        if reader.fieldnames != EXPECTED_COLUMNS:
+            raise RuntimeError(
+                f"Header CSV không đúng. Nhận được: {reader.fieldnames}"
+            )
+        for line_number, row in enumerate(reader, start=2):
+            next_line = db.execute(
+                "SELECT next_line FROM simulator_state WHERE source_file = ?",
+                (SOURCE_FILE,),
+            ).fetchone()[0]
+            if line_number < next_line:
+                continue
+            if line_number != next_line:
+                raise RuntimeError("CSV cursor khong lien tuc")
+
+            if None in row or any(value is None for value in row.values()):
+                raise RuntimeError(
+                    f"Bản ghi CSV {line_number} bị thiếu hoặc thừa trường"
+                )
+
+            # Wait before creating the event, without holding a SQLite write lock.
+            time.sleep(random.uniform(delay_min, delay_max))
+
             try:
+                db.execute("BEGIN IMMEDIATE")
+                # Recheck inside the transaction before advancing the cursor.
                 next_line = db.execute(
                     "SELECT next_line FROM simulator_state WHERE source_file = ?",
                     (SOURCE_FILE,),
@@ -127,14 +187,14 @@ def simulate_swipes(db: sqlite3.Connection) -> int:
                     (line_number + 1, SOURCE_FILE),
                 )
                 db.commit()
-            except Exception:
+            except BaseException:
                 db.rollback()
                 raise
 
-            delay = random.uniform(1.0, 5.0)
-            time.sleep(delay)
             created += 1
-            print(f"POS swipe | CSV line {line_number} | ID {tx_id} | PENDING")
+            print(f"POS swipe | CSV record {line_number} | ID {tx_id} | SAVED", flush=True)
+            if limit and created >= limit:
+                break
     return created
 
 
@@ -156,15 +216,29 @@ def print_status(db: sqlite3.Connection) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="So giao dich moi toi da; 0 la doc den het CSV")
     args = parser.parse_args()
-    with open_database() as db:
-        initialize_source(db)
-        if args.status:
+    if args.limit < 0:
+        parser.error("--limit phai >= 0")
+    if args.status:
+        with closing(open_database()) as db:
             print_status(db)
-            return
-        count = simulate_swipes(db)
-        print(f"Da ghi ben vung {count} giao dich gia lap vao SQLite")
-        print_status(db)
+        return
+
+    # Validate configuration before initializing persistent source state.
+    load_delay_bounds()
+    with simulator_lock(), closing(open_database()) as db:
+        try:
+            initialize_source(db)
+            count = simulate_swipes(db, limit=args.limit)
+            print(f"Da ghi ben vung {count} giao dich gia lap vao SQLite", flush=True)
+        except KeyboardInterrupt:
+            print("\nPOS da dung. Cac giao dich da commit duoc giu nguyen.", flush=True)
+        finally:
+            if db.in_transaction:
+                db.rollback()
+            print_status(db)
 
 
 if __name__ == "__main__":
