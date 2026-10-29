@@ -155,8 +155,42 @@ def report_tables(spark, transactions, top_n):
                      .filter(F.col("success_count") > 0)
                      .orderBy(F.desc("success_amount_vnd"), F.desc("success_amount_usd"), "merchant")
                      .limit(top_n))
-    return {"by_status": by_status, "by_day": by_day, "top_merchants": top_merchants}
+    dated = (
+        transactions
+        .withColumn(
+            "transaction_month",
+            F.when(
+                F.col("transaction_date") == "UNKNOWN_DATE",
+                F.lit("UNKNOWN_MONTH"),
+            ).otherwise(F.substring("transaction_date", 1, 7)),
+        )
+        .withColumn(
+            "transaction_year",
+            F.when(
+                F.col("transaction_date") == "UNKNOWN_DATE",
+                F.lit("UNKNOWN_YEAR"),
+            ).otherwise(F.substring("transaction_date", 1, 4)),
+        )
+    )
 
+    tables = {
+        "by_status": by_status,
+        "by_day": by_day,
+        "top_merchants": top_merchants,
+    }
+
+    for name, period in (
+        ("merchant_by_day", "transaction_date"),
+        ("merchant_by_month", "transaction_month"),
+        ("merchant_by_year", "transaction_year"),
+    ):
+        tables[name] = (
+            dated.groupBy("merchant", period)
+            .agg(*metrics())
+            .orderBy(period, "merchant")
+        )
+
+    return tables
 
 def build_reports(spark, base, top_n=10):
     if top_n < 1:
