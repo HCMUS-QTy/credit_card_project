@@ -1,303 +1,148 @@
+"""Khởi chạy Kafka → Spark → Hadoop. Dùng run_streaming.py ở thư mục gốc."""
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, from_json, regexp_replace, to_date,
-    concat_ws, lpad, date_format, concat, lit,upper, trim, when
-)
-from pyspark.sql.types import StructType, StructField, StringType
+import fcntl
+import hashlib
 import os
+import sys
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+
 from dotenv import load_dotenv
-import json
-from decimal import Decimal
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from pyspark.sql import DataFrame, SparkSession
 
+# spark-submit chạy file trực tiếp, cần thư mục gốc để import package.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / ".env")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-HDFS_BASE_PATH = os.environ["HDFS_BASE_PATH"].rstrip("/")
-HDFS_CHECKPOINT_PATH = os.environ["HDFS_CHECKPOINT_PATH"]
+from scripts.build_curated import HadoopStore
+from streaming.batch_processor import BatchProcessor
+from streaming.batch_storage import bind_lineage
+from streaming.fx_rates import FxRateProvider
+from streaming.transformations import transform_transactions
 
-KAFKA_BOOTSTRAP_SERVERS = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
-KAFKA_TOPIC = os.environ["KAFKA_TOPIC"]
-SPARK_MASTER = os.getenv("SPARK_MASTER", "local[2]")
 
-FX_RATE_FILE = PROJECT_ROOT / os.environ["FX_RATE_FILE"]
+@dataclass(frozen=True)
+class StreamingConfig:
+    output_path: str
+    checkpoint_path: str
+    rate_file: Path
+    rate_type: str
+    spark_master: str
+    kafka_servers: str
+    kafka_topic: str
 
-def load_fx_rate():
-    data = json.loads(
-        FX_RATE_FILE.read_text(encoding="utf-8")
+
+def load_config() -> StreamingConfig:
+    load_dotenv(PROJECT_ROOT / ".env")
+    output_path = os.environ["HDFS_BASE_PATH"].rstrip("/")
+    checkpoint_path = os.environ["HDFS_CHECKPOINT_PATH"].rstrip("/")
+    if not output_path or not checkpoint_path:
+        raise RuntimeError("Can HDFS_BASE_PATH va HDFS_CHECKPOINT_PATH")
+
+    base_currency = os.getenv("FX_BASE_CURRENCY", "USD")
+    quote_currency = os.getenv("FX_QUOTE_CURRENCY", "VND")
+    if (base_currency, quote_currency) != ("USD", "VND"):
+        raise RuntimeError("Pipeline nay chi ho tro USD/VND")
+    rate_type = os.getenv("FX_RATE_TYPE", "transfer_buy")
+    if rate_type not in {"transfer_buy", "cash_buy", "sell"}:
+        raise RuntimeError("FX_RATE_TYPE khong hop le")
+
+    rate_file = Path(os.environ["FX_RATE_FILE"]).expanduser()
+    if not rate_file.is_absolute():
+        rate_file = PROJECT_ROOT / rate_file
+    return StreamingConfig(
+        output_path=output_path,
+        checkpoint_path=checkpoint_path,
+        rate_file=rate_file,
+        rate_type=rate_type,
+        spark_master=os.getenv("SPARK_MASTER", "local[2]"),
+        kafka_servers=os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+        kafka_topic=os.environ["KAFKA_TOPIC"],
     )
 
-    if (
-        data.get("base_currency") != os.environ["FX_BASE_CURRENCY"]
-        or data.get("quote_currency") != os.environ["FX_QUOTE_CURRENCY"]
-        or data.get("rate_type") != os.environ["FX_RATE_TYPE"]
-    ):
-        raise RuntimeError("Cau hinh ty gia khong khop .env")
 
-    rate = Decimal(data["rate"])
+@contextmanager
+def single_streaming_process(output_path: str):
+    lock_id = hashlib.sha256(output_path.encode()).hexdigest()[:16]
+    lock_path = PROJECT_ROOT / "data" / f"streaming_{lock_id}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Mot streaming khac dang dung cung vung du lieu") from None
+        yield
 
-    if not rate.is_finite() or rate <= 0:
-        raise RuntimeError("Ty gia khong hop le")
 
-    tz = ZoneInfo("Asia/Ho_Chi_Minh")
-    retrieved = datetime.fromisoformat(
-        data["retrieved_at"]
-    ).astimezone(tz)
+def create_spark_session(master: str) -> SparkSession:
+    spark = (
+        SparkSession.builder
+        .appName("CreditCardParse")
+        .master(master)
+        .config("spark.sql.session.timeZone", "Asia/Ho_Chi_Minh")
+        .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
+        .config("spark.sql.shuffle.partitions", "2")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("ERROR")
+    return spark
 
-    if retrieved.date() != datetime.now(tz).date():
-        raise RuntimeError(
-            "Ty gia da cu. Hay cap nhat usd_vnd_rate.json"
-        )
 
+def require_hdfs(spark: SparkSession, config: StreamingConfig) -> HadoopStore:
+    output_store = HadoopStore(spark, config.output_path)
+    checkpoint_store = HadoopStore(spark, config.checkpoint_path)
+    output_uri = output_store.fs.getUri()
+    checkpoint_uri = checkpoint_store.fs.getUri()
+    if output_uri.getScheme() != "hdfs" or output_uri.toString() != checkpoint_uri.toString():
+        raise RuntimeError("Output/checkpoint phai o cung HDFS. Kiem tra HADOOP_CONF_DIR.")
+    return output_store
+
+
+def read_kafka(spark: SparkSession, config: StreamingConfig) -> DataFrame:
     return (
-    rate,
-    data["retrieved_at"],
-    data.get("bank_published_at")
-)
-
-
-columns = [
-    "User", "Card", "Year", "Month", "Day", "Time",
-    "Amount", "Use Chip", "Merchant Name", "Merchant City",
-    "Merchant State", "Zip", "MCC", "Errors?", "Is Fraud?",
-    "transaction_id", "pos_event_time", "currency"
-]
-
-schema = StructType([
-    StructField(c, StringType(), True) for c in columns
-])
-
-spark = (
-    SparkSession.builder
-    .appName("CreditCardParse")
-    .master(SPARK_MASTER)
-    .getOrCreate()
-)
-
-spark.sparkContext.setLogLevel("ERROR")
-
-raw = (
-    spark.readStream
-    .format("kafka")
-    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
-    .option("subscribe", KAFKA_TOPIC)
-    .option("startingOffsets", "earliest")
-    .load()
-)
-
-parsed = (
-    raw.select(
-        col("offset"),
-        from_json(col("value").cast("string"), schema).alias("tx")
+        spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", config.kafka_servers)
+        .option("subscribe", config.kafka_topic)
+        .option("startingOffsets", "earliest")
+        .option("failOnDataLoss", "true")
+        .load()
     )
-    .select("offset", "tx.*")
-)
 
-cleaned = (
-    parsed
-    .withColumn(
-        "amount_numeric",
-        regexp_replace(col("Amount"), r"[$,]", "")
-        .cast("decimal(18,2)")
+
+def run_stream(spark: SparkSession, config: StreamingConfig) -> None:
+    store = require_hdfs(spark, config)
+    lineage_id = bind_lineage(store, config.output_path, config.checkpoint_path)
+    rate_provider = FxRateProvider(config.rate_file, config.rate_type)
+    processor = BatchProcessor(spark, config.output_path, rate_provider, lineage_id)
+
+    raw_transactions = read_kafka(spark, config)
+    transactions = transform_transactions(raw_transactions)
+    query = (
+        transactions.writeStream
+        .foreachBatch(processor.process_batch)
+        .outputMode("append")
+        .option("checkpointLocation", config.checkpoint_path)
+        .start()
     )
-    .withColumn(
-        "transaction_date",
-        to_date(
-            concat_ws(
-                "-",
-                lpad(col("Year"), 4, "0"),
-                lpad(col("Month"), 2, "0"),
-                lpad(col("Day"), 2, "0")
-            ),
-            "yyyy-MM-dd"
-        )
-    )
-    .withColumn(
-        "date_formatted",
-        date_format(col("transaction_date"), "dd/MM/yyyy")
-    )
-    .withColumn(
-        "time_formatted",
-        concat(col("Time"), lit(":00"))
-    )
-)
-
-result = cleaned.select(
-    "offset",
-    "User",
-    "Card",
-    "date_formatted",
-    "time_formatted",
-     "transaction_id",
-    "pos_event_time",
-    "currency",
-    col("Merchant Name").alias("merchant"),
-    col("Merchant City").alias("city"),
-    "amount_numeric",col("Errors?").alias("errors"),
-    col("Is Fraud?").alias("is_fraud")
-)
-
-
-classified = (
-    result.withColumn(
-        "transaction_status",
-        when(
-            upper(trim(col("is_fraud"))) == "YES",
-            "FRAUD"
-        )
-        .when(
-            upper(trim(col("is_fraud"))) == "NO",
-            "NON_FRAUD"
-        )
-        .otherwise("INVALID_FLAG")
-    ).withColumn(
-    "error_status",
-    when(
-        col("errors").isNull() |
-        (trim(col("errors")) == ""),
-        "NO_ERROR"
-    ).otherwise("HAS_ERROR")
-)
-)
-
-finalized = (
-    classified.withColumn(
-        "final_status",
-        when(
-            col("transaction_status") == "FRAUD",
-            "REJECTED_FRAUD"
-        )
-        .when(
-            col("transaction_status") == "INVALID_FLAG",
-            "INVALID_FLAG"
-        )
-        .when(
-            col("date_formatted").isNull() |
-            col("amount_numeric").isNull(),
-            "INVALID_DATA"
-        )
-        .when(
-            col("error_status") == "HAS_ERROR",
-            "REJECTED_ERROR"
-        )
-        .otherwise("SUCCESS")
-    )
-)
-
-
-def process_batch(batch_df, batch_id):
-    if batch_df.isEmpty():
-        return
-
-    print(f"\n========== BATCH {batch_id} ==========")
-
-    batch_df.cache()
-
     try:
-        # Phân loại giao dịch
-        batch_df.select(
-            "transaction_id", "User", "Card", "final_status"
-        ).show(5, truncate=False)
-        
-        success_df = batch_df.filter(
-            col("final_status") == "SUCCESS"
-        )
-
-        fraud_df = batch_df.filter(
-            col("final_status") == "REJECTED_FRAUD"
-        )
-
-        error_df = batch_df.filter(
-            col("final_status") == "REJECTED_ERROR"
-        )
-
-        invalid_df = batch_df.filter(
-            col("final_status").isin(
-                "INVALID_FLAG", "INVALID_DATA"
-            )
-        )
-
-        # Chỉ quy đổi giao dịch thành công
-        if not success_df.isEmpty():
-            rate, retrieved_at, published_at = load_fx_rate()
-
-            success_df = (
-                success_df
-                .withColumn(
-                    "fx_rate",
-                    lit(rate).cast("decimal(18,4)")
-                )
-                .withColumn(
-                    "fx_retrieved_at",
-                    lit(retrieved_at)
-                )
-                .withColumn(
-                    "fx_bank_published_at",
-                    lit(published_at or "").cast("string")
-                )
-                .withColumn(
-                    "amount_vnd",
-                    (
-                        col("amount_numeric") * col("fx_rate")
-                    ).cast("decimal(24,2)")
-                )
-            )
-
-        # Lưu riêng theo trạng thái
-        groups = {
-            "success": success_df,
-            "fraud": fraud_df,
-            "errors": error_df,
-            "invalid": invalid_df
-        }
-
-        for group_name, df in groups.items():
-            if df.isEmpty():
-                continue
-
-            output_path = (
-                f"{HDFS_BASE_PATH}/processed_v2/"
-                f"{group_name}/batch_id={batch_id:010d}"
-            )
-
-            (
-                df.write
-                .mode("overwrite")
-                .option("header", "true")
-                .csv(output_path)
-            )
-
-            print(f"Saved {group_name}: {output_path}")
-
-        print(f"Batch {batch_id} completed")
-
+        query.awaitTermination()
     finally:
-        batch_df.unpersist()
+        query.stop()
 
 
-
-query = (
-    finalized.writeStream
-    .foreachBatch(process_batch)
-    .outputMode("append")
-    .option("checkpointLocation", HDFS_CHECKPOINT_PATH)
-    .start()
-)
-
-try:
-    query.awaitTermination()
-except KeyboardInterrupt:
-    query.stop()
-finally:
-    spark.stop()
+def main() -> None:
+    config = load_config()
+    with single_streaming_process(config.output_path):
+        spark = create_spark_session(config.spark_master)
+        try:
+            run_stream(spark, config)
+        except KeyboardInterrupt:
+            print("\nDang dung streaming...", flush=True)
+        finally:
+            spark.stop()
 
 
-try:
-    query.awaitTermination()
-except KeyboardInterrupt:
-    query.stop()
-finally:
-    spark.stop()
+if __name__ == "__main__":
+    main()
