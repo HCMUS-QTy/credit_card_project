@@ -9,3 +9,6 @@ data/*.sqlite3-wal
 data/*.sqlite3-shm
 
 data/*.lock
+
+# Generated Power BI exports (CSV, metadata and snapshots)
+powerbi/data/
