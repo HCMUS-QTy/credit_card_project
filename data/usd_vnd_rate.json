@@ -3,8 +3,8 @@
   "quote_currency": "VND",
   "rate_type": "transfer_buy",
   "rate": "25640.00",
-  "bank_published_at": "2026-10-28T07:58:18+07:00",
-  "retrieved_at": "2026-10-28T23:01:10+07:00",
-  "source": "Vietcombank HTML",
-  "source_url": "https://www.vietcombank.com.vn/KHCN/Cong-cu-Tien-ich/Ty-gia"
+  "bank_published_at": "2026-10-29T20:00:10+07:00",
+  "retrieved_at": "2026-10-29T20:01:17+07:00",
+  "source": "Vietcombank XML",
+  "source_url": "https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx"
 }
