@@ -1,0 +1,25 @@
+// Modeling > New table. Paste this entire expression once.
+Calendar =
+VAR ValidDates =
+    FILTER (
+        ALL ( Transactions[TransactionDate] ),
+        NOT ISBLANK ( Transactions[TransactionDate] )
+    )
+VAR FirstDate = MINX ( ValidDates, Transactions[TransactionDate] )
+VAR LastDate = MAXX ( ValidDates, Transactions[TransactionDate] )
+// The fallback only prevents CALENDAR from receiving blank bounds.
+// FILTER below removes it when every transaction has an unknown date.
+VAR SafeFirstDate = COALESCE ( FirstDate, DATE ( 2000, 1, 1 ) )
+VAR SafeLastDate = COALESCE ( LastDate, SafeFirstDate )
+RETURN
+    FILTER (
+        ADDCOLUMNS (
+            CALENDAR ( SafeFirstDate, SafeLastDate ),
+            "Year", YEAR ( [Date] ),
+            "MonthNumber", MONTH ( [Date] ),
+            "MonthName", FORMAT ( [Date], "mmm" ),
+            "YearMonth", FORMAT ( [Date], "yyyy-MM" ),
+            "YearMonthSort", YEAR ( [Date] ) * 100 + MONTH ( [Date] )
+        ),
+        NOT ISBLANK ( FirstDate )
+    )

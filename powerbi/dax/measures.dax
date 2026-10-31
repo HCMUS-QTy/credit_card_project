@@ -1,0 +1,71 @@
+// Create EACH named block separately with Modeling > New measure.
+// These definitions assume the imported query is named Transactions.
+
+Total Transactions =
+COALESCE ( COUNTROWS ( Transactions ), 0 )
+
+Successful Transactions =
+CALCULATE (
+    [Total Transactions],
+    KEEPFILTERS ( Transactions[final_status] = "SUCCESS" )
+)
+
+Fraud Transactions =
+CALCULATE (
+    [Total Transactions],
+    KEEPFILTERS ( Transactions[final_status] = "REJECTED_FRAUD" )
+)
+
+Rejected Error Transactions =
+CALCULATE (
+    [Total Transactions],
+    KEEPFILTERS ( Transactions[final_status] = "REJECTED_ERROR" )
+)
+
+Invalid Transactions =
+CALCULATE (
+    [Total Transactions],
+    KEEPFILTERS ( Transactions[final_status] IN { "INVALID_FLAG", "INVALID_DATA" } )
+)
+
+Unsuccessful Transactions =
+[Total Transactions] - [Successful Transactions]
+
+Success Amount USD =
+COALESCE (
+    CALCULATE (
+        SUM ( Transactions[amount_numeric] ),
+        KEEPFILTERS ( Transactions[final_status] = "SUCCESS" )
+    ),
+    0
+)
+
+Success Amount VND =
+COALESCE (
+    CALCULATE (
+        SUM ( Transactions[amount_vnd] ),
+        KEEPFILTERS ( Transactions[final_status] = "SUCCESS" )
+    ),
+    0
+)
+
+Fraud Rate =
+DIVIDE ( [Fraud Transactions], [Total Transactions], 0 )
+
+Success Rate =
+DIVIDE ( [Successful Transactions], [Total Transactions], 0 )
+
+Dated Transactions =
+CALCULATE (
+    [Total Transactions],
+    KEEPFILTERS ( NOT ISBLANK ( Transactions[TransactionDate] ) )
+)
+
+// Unknown dates cannot belong to a month/year; keep this diagnostic visible.
+// Merchant/city/status filters still apply, but Calendar filters are removed.
+Undated Transactions =
+CALCULATE (
+    [Total Transactions],
+    REMOVEFILTERS ( 'Calendar' ),
+    KEEPFILTERS ( ISBLANK ( Transactions[TransactionDate] ) )
+)
