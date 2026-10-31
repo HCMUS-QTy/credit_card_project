@@ -95,8 +95,8 @@ def dispatch(db: sqlite3.Connection, producer, limit: int) -> int:
             break
         transaction_id, payload_json = row
 
-        # delay = random.uniform(1.0, 5.0)
-        # time.sleep(delay)
+        delay = random.uniform(1.0, 5.0)
+        time.sleep(delay)
 
         # Ghi nhận lần thử gửi sau khi đã chờ.
         mark_attempt(db, transaction_id)
